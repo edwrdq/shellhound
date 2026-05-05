@@ -1,10 +1,8 @@
 use serde_json::Value;
-use std::{
-    fs,
-    io::ErrorKind,
-    path::PathBuf,
-    process::{Command, Output},
-};
+use std::{fs, io::ErrorKind, path::PathBuf, process::Stdio};
+use tauri::{AppHandle, Emitter};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::Command as TokioCommand;
 
 fn workspace_root() -> Result<PathBuf, String> {
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
@@ -41,7 +39,6 @@ fn read_json_file(file_name: &str) -> Result<Value, String> {
             if contents.trim().is_empty() {
                 return Ok(Value::Array(Vec::new()));
             }
-
             serde_json::from_str(&contents)
                 .map_err(|error| format!("Invalid JSON in {}: {error}", path.display()))
         }
@@ -50,16 +47,17 @@ fn read_json_file(file_name: &str) -> Result<Value, String> {
     }
 }
 
-fn write_json_file(file_name: &str, data: Value) -> Result<(), String> {
+fn write_json_string(file_name: &str, data: &str) -> Result<(), String> {
     let path = data_file(file_name)?;
     let directory = path
         .parent()
         .ok_or_else(|| format!("Unable to resolve parent for {}", path.display()))?;
-
     fs::create_dir_all(directory)
         .map_err(|error| format!("Unable to create {}: {error}", directory.display()))?;
 
-    let body = serde_json::to_string_pretty(&data).map_err(|error| error.to_string())?;
+    let parsed: Value = serde_json::from_str(data)
+        .map_err(|error| format!("Invalid JSON payload for {file_name}: {error}"))?;
+    let body = serde_json::to_string_pretty(&parsed).map_err(|error| error.to_string())?;
     fs::write(&path, format!("{body}\n"))
         .map_err(|error| format!("Unable to write {}: {error}", path.display()))
 }
@@ -70,8 +68,8 @@ fn read_entities() -> Result<Value, String> {
 }
 
 #[tauri::command]
-fn write_entities(data: Value) -> Result<(), String> {
-    write_json_file("entities.json", data)
+fn write_entities(data: String) -> Result<(), String> {
+    write_json_string("entities.json", &data)
 }
 
 #[tauri::command]
@@ -80,8 +78,8 @@ fn read_relationships() -> Result<Value, String> {
 }
 
 #[tauri::command]
-fn write_relationships(data: Value) -> Result<(), String> {
-    write_json_file("relationships.json", data)
+fn write_relationships(data: String) -> Result<(), String> {
+    write_json_string("relationships.json", &data)
 }
 
 #[tauri::command]
@@ -90,92 +88,110 @@ fn read_financials() -> Result<Value, String> {
 }
 
 #[tauri::command]
-fn write_financials(data: Value) -> Result<(), String> {
-    write_json_file("financials.json", data)
-}
-
-fn scraper_dir() -> Result<PathBuf, String> {
-    Ok(workspace_root()?.join("scraper"))
-}
-
-fn ensure_scraper_environment(scraper_directory: &PathBuf) -> Result<(), String> {
-    if scraper_directory.join(".venv").exists() {
-        return Ok(());
-    }
-
-    let output = Command::new("uv")
-        .arg("sync")
-        .current_dir(scraper_directory)
-        .output()
-        .map_err(|error| format!("Unable to run uv sync: {error}"))?;
-
-    if output.status.success() {
-        return Ok(());
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Err(format!(
-        "uv sync failed with {}: {}{}",
-        output.status, stderr, stdout
-    ))
-}
-
-fn invoke_python(
-    scraper_directory: &PathBuf,
-    script: &PathBuf,
-    seed: &str,
-    scraper_type: &str,
-) -> Result<Output, String> {
-    let root = workspace_root()?;
-    let script_arg = script.strip_prefix(&root).unwrap_or(script.as_path());
-
-    Command::new("uv")
-        .arg("run")
-        .arg("python")
-        .arg(script_arg)
-        .arg("--seed")
-        .arg(seed)
-        .arg("--scraper-type")
-        .arg(scraper_type)
-        .arg("--json")
-        .env("UV_PROJECT", scraper_directory)
-        .current_dir(root)
-        .output()
-        .map_err(|error| error.to_string())
+fn write_financials(data: String) -> Result<(), String> {
+    write_json_string("financials.json", &data)
 }
 
 #[tauri::command]
-fn run_scraper(seed: String, scraper_type: String) -> Result<Value, String> {
-    let seed = seed.trim();
+fn clear_data() -> Result<(), String> {
+    write_json_string("entities.json", "[]")?;
+    write_json_string("relationships.json", "[]")?;
+    write_json_string("financials.json", "[]")?;
+    Ok(())
+}
+
+async fn stream_command(
+    app: &AppHandle,
+    mut cmd: TokioCommand,
+    label: &str,
+) -> Result<i32, String> {
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .map_err(|error| format!("Unable to spawn {label}: {error}"))?;
+
+    if let Some(stdout) = child.stdout.take() {
+        let app = app.clone();
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                let _ = app.emit("scraper-log", line);
+            }
+        });
+    }
+
+    if let Some(stderr) = child.stderr.take() {
+        let app = app.clone();
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                let _ = app.emit("scraper-log", format!("[stderr] {line}"));
+            }
+        });
+    }
+
+    let status = child
+        .wait()
+        .await
+        .map_err(|error| format!("Wait failed: {error}"))?;
+    Ok(status.code().unwrap_or(-1))
+}
+
+#[tauri::command]
+async fn run_scraper(
+    seed: String,
+    seed_type: String,
+    depth: u32,
+    app: AppHandle,
+) -> Result<(), String> {
+    let seed = seed.trim().to_string();
     if seed.is_empty() {
         return Err("Seed is required".to_string());
     }
 
-    let scraper_directory = scraper_dir()?;
-    let script = scraper_directory.join("crawler.py");
+    let root = workspace_root()?;
+    let scraper_directory = root.join("scraper");
+    let script = scraper_directory.join("main.py");
     if !script.exists() {
         return Err(format!("Scraper script not found at {}", script.display()));
     }
 
-    ensure_scraper_environment(&scraper_directory)?;
-
-    match invoke_python(&scraper_directory, &script, seed, &scraper_type) {
-        Ok(output) if output.status.success() => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            serde_json::from_str(&stdout)
-                .map_err(|error| format!("Scraper returned invalid JSON: {error}"))
+    // Ensure venv
+    if !scraper_directory.join(".venv").exists() {
+        let _ = app.emit("scraper-log", "Running uv sync...".to_string());
+        let mut sync_cmd = TokioCommand::new("uv");
+        sync_cmd.arg("sync").current_dir(&scraper_directory);
+        let code = stream_command(&app, sync_cmd, "uv sync").await?;
+        if code != 0 {
+            let _ = app.emit("scraper-done", code);
+            return Err(format!("uv sync exited with code {code}"));
         }
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            Err(format!(
-                "uv run python exited with {}: {}{}",
-                output.status, stderr, stdout
-            ))
-        }
-        Err(error) => Err(format!("uv run python: {error}")),
     }
+
+    let _ = app.emit(
+        "scraper-log",
+        format!("Starting scraper: seed={seed} type={seed_type} depth={depth}"),
+    );
+
+    let mut cmd = TokioCommand::new("uv");
+    cmd.arg("run")
+        .arg("python")
+        .arg("main.py")
+        .arg("--seed")
+        .arg(&seed)
+        .arg("--type")
+        .arg(&seed_type)
+        .arg("--depth")
+        .arg(depth.to_string())
+        .current_dir(&scraper_directory)
+        .env("PYTHONUNBUFFERED", "1");
+
+    let code = stream_command(&app, cmd, "scraper").await?;
+    let _ = app.emit("scraper-done", code);
+    if code != 0 {
+        return Err(format!("Scraper exited with code {code}"));
+    }
+    Ok(())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -189,7 +205,8 @@ pub fn run() {
             write_relationships,
             read_financials,
             write_financials,
-            run_scraper
+            run_scraper,
+            clear_data
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

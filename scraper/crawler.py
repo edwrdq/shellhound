@@ -1,241 +1,313 @@
-"""Recursive discovery orchestrator for Shellhound scraper modules."""
-
+"""Recursive discovery orchestrator for Shellhound."""
 from __future__ import annotations
 
-import argparse
+import hashlib
 import json
 import re
 import sys
-from hashlib import sha1
+import uuid
 from pathlib import Path
 from typing import Any
 
-if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from . import irs, propublica, sunbiz
 
-from scraper import irs, propublica, sunbiz  # noqa: E402
-
-
-Entity = dict[str, Any]
-Relationship = dict[str, Any]
-Financial = dict[str, Any]
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+ENTITIES_PATH = DATA_DIR / "entities.json"
+RELATIONSHIPS_PATH = DATA_DIR / "relationships.json"
+FINANCIALS_PATH = DATA_DIR / "financials.json"
 
 
-def _clean(value: str | None) -> str:
-    return re.sub(r"\s+", " ", value or "").strip()
+def _progress(message: str) -> None:
+    payload = json.dumps({"event": "progress", "message": message})
+    print(payload, flush=True)
+    print(message, flush=True)
 
 
-def _person_id(name: str) -> str:
-    normalized = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
-    digest = sha1(name.encode("utf-8")).hexdigest()[:8]
-    return f"person-{normalized or 'unknown'}-{digest}"
-
-
-def _person_entity(name: str) -> Entity:
-    return {
-        "id": _person_id(name),
-        "name": name,
-        "type": "individual",
-        "ein": "",
-        "state": "",
-        "status": "Person",
-        "registered_agent": "",
-        "officers": [],
-        "metadata": {"source": "crawler"},
-    }
-
-
-def _normalize_entity(entity: Entity) -> Entity:
-    return {
-        "id": str(entity.get("id") or _person_id(str(entity.get("name") or "unknown"))),
-        "name": str(entity.get("name") or "Unknown"),
-        "type": str(entity.get("type") or "llc").lower(),
-        "ein": str(entity.get("ein") or ""),
-        "state": str(entity.get("state") or ""),
-        "status": str(entity.get("status") or ""),
-        "registered_agent": str(entity.get("registered_agent") or ""),
-        "officers": list(entity.get("officers") or []),
-        "metadata": dict(entity.get("metadata") or {}),
-    }
-
-
-def _relationship(
-    source_id: str,
-    target_id: str,
-    relationship_type: str,
-    description: str,
-    year: int | None = None,
-) -> Relationship:
-    return {
-        "source_id": source_id,
-        "target_id": target_id,
-        "type": relationship_type,
-        "amount": None,
-        "description": description,
-        "year": year,
-    }
-
-
-def _merge_entity(entities: dict[str, Entity], entity: Entity) -> Entity:
-    normalized = _normalize_entity(entity)
-    entities[normalized["id"]] = normalized
-    return normalized
-
-
-def _merge_relationship(relationships: dict[str, Relationship], relationship: Relationship) -> None:
-    key = (
-        f"{relationship['source_id']}:{relationship['target_id']}:"
-        f"{relationship['type']}:{relationship.get('year') or ''}"
-    )
-    relationships[key] = relationship
-
-
-def _collect_financials(entities: dict[str, Entity], errors: list[str]) -> list[Financial]:
-    financials: dict[str, Financial] = {}
-
-    for entity in entities.values():
-        ein = _clean(entity.get("ein"))
-        if not ein or entity.get("type") != "nonprofit":
-            continue
-
-        try:
-            for financial in propublica.get_financials_by_ein(ein):
-                financials[f"{financial['ein']}:{financial['year']}"] = financial
-        except Exception as error:  # noqa: BLE001 - surfaced in UI JSON.
-            errors.append(f"ProPublica {ein}: {error}")
-
-    return list(financials.values())
-
-
-def run_single(seed: str, scraper_type: str, limit: int) -> dict[str, Any]:
-    errors: list[str] = []
-    entities: list[Entity] = []
-    financials: list[Financial] = []
-
+def _read_list(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
     try:
-        if scraper_type == "sunbiz":
-            entities = [_normalize_entity(entity) for entity in sunbiz.search_entities(seed, limit)]
-        elif scraper_type == "irs":
-            entities = [_normalize_entity(entity) for entity in irs.search_tax_exempt(seed, limit)]
-        elif scraper_type == "propublica":
-            financials = propublica.get_financials_by_ein(seed)
-        else:
-            raise ValueError(f"Unsupported scraper type: {scraper_type}")
-    except Exception as error:  # noqa: BLE001 - returned as structured JSON.
-        errors.append(str(error))
-
-    return {
-        "seed": seed,
-        "scraper_type": scraper_type,
-        "entities": entities,
-        "relationships": [],
-        "financials": financials,
-        "errors": errors,
-    }
+        text = path.read_text(encoding="utf-8").strip()
+        if not text:
+            return []
+        data = json.loads(text)
+        return data if isinstance(data, list) else []
+    except Exception as exc:  # noqa: BLE001
+        print(f"crawler: read {path} error: {exc}", file=sys.stderr, flush=True)
+        return []
 
 
-def crawl(seed: str, depth: int = 2, limit: int = 8) -> dict[str, Any]:
-    entities: dict[str, Entity] = {}
-    relationships: dict[str, Relationship] = {}
-    errors: list[str] = []
-    visited_terms: set[str] = set()
-    queue: list[tuple[str, int]] = [(seed, 0)]
-
-    while queue:
-        term, level = queue.pop(0)
-        normalized_term = term.lower()
-
-        if normalized_term in visited_terms or level > depth:
-            continue
-
-        visited_terms.add(normalized_term)
-
-        try:
-            matches = sunbiz.search_entities(term, limit=limit)
-        except Exception as error:  # noqa: BLE001 - returned as structured JSON.
-            errors.append(f"Sunbiz entity search {term}: {error}")
-            continue
-
-        for raw_entity in matches:
-            entity = _merge_entity(entities, raw_entity)
-
-            for officer_name in entity["officers"][:limit]:
-                officer_name = _clean(officer_name)
-                if not officer_name:
-                    continue
-
-                person = _merge_entity(entities, _person_entity(officer_name))
-                _merge_relationship(
-                    relationships,
-                    _relationship(
-                        entity["id"],
-                        person["id"],
-                        "officer",
-                        f"{officer_name} listed as officer or manager",
-                    ),
-                )
-
-                if level + 1 > depth:
-                    continue
-
-                try:
-                    related_entities = sunbiz.search_by_officer(officer_name, limit=limit)
-                except Exception as error:  # noqa: BLE001 - returned as structured JSON.
-                    errors.append(f"Sunbiz officer search {officer_name}: {error}")
-                    continue
-
-                for related_raw in related_entities:
-                    related = _merge_entity(entities, related_raw)
-                    _merge_relationship(
-                        relationships,
-                        _relationship(
-                            person["id"],
-                            related["id"],
-                            "officer-affiliation",
-                            f"{officer_name} appears on Sunbiz filing",
-                        ),
-                    )
-
-                    if related["name"].lower() not in visited_terms:
-                        queue.append((related["name"], level + 1))
-
-    financials = _collect_financials(entities, errors)
-
-    return {
-        "seed": seed,
-        "scraper_type": "crawler",
-        "entities": list(entities.values()),
-        "relationships": list(relationships.values()),
-        "financials": financials,
-        "errors": errors,
-    }
+def _write_list(path: Path, data: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Run Shellhound scraper workflows")
-    parser.add_argument("--seed", required=True, help="Organization name, officer name, or EIN")
-    parser.add_argument(
-        "--scraper-type",
-        default="crawler",
-        choices=("crawler", "sunbiz", "irs", "propublica"),
+def _norm_name(name: str) -> str:
+    return re.sub(r"\s+", " ", (name or "").strip().lower())
+
+
+def _stable_id(*parts: str) -> str:
+    raw = "|".join(p.strip().lower() for p in parts if p)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:24]
+
+
+def _visit_key(name: str, ein: str | None) -> str:
+    return f"{_norm_name(name)}|{ein or ''}"
+
+
+class CrawlState:
+    def __init__(self) -> None:
+        self.entities: dict[str, dict[str, Any]] = {
+            e["id"]: e for e in _read_list(ENTITIES_PATH) if e.get("id")
+        }
+        self.relationships: dict[str, dict[str, Any]] = {}
+        for rel in _read_list(RELATIONSHIPS_PATH):
+            self.relationships[self._rel_key(rel)] = rel
+        self.financials: dict[str, dict[str, Any]] = {}
+        for fin in _read_list(FINANCIALS_PATH):
+            key = f"{fin.get('ein')}:{fin.get('year')}"
+            self.financials[key] = fin
+        self.errors: list[str] = []
+        self.visited: set[str] = set()
+
+    @staticmethod
+    def _rel_key(rel: dict[str, Any]) -> str:
+        return (
+            f"{rel.get('source_id')}:{rel.get('target_id')}:"
+            f"{rel.get('type')}:{rel.get('year') or ''}"
+        )
+
+    def add_entity(self, entity: dict[str, Any]) -> str:
+        eid = entity.get("id") or uuid.uuid4().hex
+        entity["id"] = eid
+        self.entities[eid] = entity
+        return eid
+
+    def add_relationship(self, rel: dict[str, Any]) -> None:
+        self.relationships[self._rel_key(rel)] = rel
+
+    def add_financial(self, fin: dict[str, Any]) -> None:
+        key = f"{fin.get('ein')}:{fin.get('year')}"
+        self.financials[key] = fin
+
+    def flush(self) -> None:
+        _write_list(ENTITIES_PATH, list(self.entities.values()))
+        _write_list(RELATIONSHIPS_PATH, list(self.relationships.values()))
+        _write_list(FINANCIALS_PATH, list(self.financials.values()))
+
+
+def _ensure_individual(state: CrawlState, name: str) -> str:
+    eid = _stable_id(name, "individual")
+    if eid not in state.entities:
+        state.entities[eid] = {
+            "id": eid,
+            "name": name,
+            "type": "individual",
+            "ein": None,
+            "state": "FL",
+            "status": "active",
+            "registered_agent": None,
+            "officers": [],
+            "sunbiz_url": None,
+            "metadata": {},
+        }
+    return eid
+
+
+async def _process_propublica(
+    state: CrawlState, ein: str, entity_id: str | None = None
+) -> dict[str, Any] | None:
+    try:
+        org = await propublica.get_organization(ein)
+    except Exception as exc:  # noqa: BLE001
+        state.errors.append(f"propublica/{ein}: {exc}")
+        _progress(f"ProPublica miss for {ein}: {exc}")
+        return None
+    organization = org.get("organization") or {}
+    name = organization.get("name") or ""
+    eid = entity_id or _stable_id(name, ein)
+    entity = state.entities.get(eid, {})
+    entity.update(
+        {
+            "id": eid,
+            "name": name or entity.get("name") or ein,
+            "type": "nonprofit",
+            "ein": re.sub(r"\D", "", ein),
+            "state": organization.get("state") or entity.get("state") or "FL",
+            "status": "active",
+            "registered_agent": entity.get("registered_agent"),
+            "officers": entity.get("officers") or [],
+            "sunbiz_url": entity.get("sunbiz_url"),
+            "metadata": {
+                **(entity.get("metadata") or {}),
+                "ntee_code": organization.get("ntee_code"),
+                "classification": organization.get("classification"),
+                "ruling_date": organization.get("ruling_date"),
+            },
+        }
     )
-    parser.add_argument("--depth", type=int, default=2)
-    parser.add_argument("--limit", type=int, default=8)
-    parser.add_argument("--json", action="store_true", help="Emit JSON only")
-    args = parser.parse_args()
+    state.entities[eid] = entity
 
-    if args.scraper_type == "crawler":
-        result = crawl(args.seed, depth=args.depth, limit=args.limit)
+    filings = org.get("filings_with_data") or []
+    for filing in filings:
+        try:
+            record = propublica.extract_financials(filing, ein)
+        except Exception as exc:  # noqa: BLE001
+            state.errors.append(f"financials/{ein}: {exc}")
+            continue
+        record["entity_id"] = eid
+        state.add_financial(record)
+
+        for executive in record.get("executives") or []:
+            ex_name = (executive.get("name") or "").strip()
+            if not ex_name:
+                continue
+            indiv_id = _ensure_individual(state, ex_name)
+            state.add_relationship(
+                {
+                    "source_id": indiv_id,
+                    "target_id": eid,
+                    "type": "officer",
+                    "amount": executive.get("compensation") or None,
+                    "description": executive.get("title") or "officer",
+                    "year": record.get("year") or None,
+                }
+            )
+
+    return entity
+
+
+async def _process_sunbiz_search(
+    state: CrawlState, query: str, search_type: str
+) -> list[dict[str, Any]]:
+    if search_type == "officer":
+        rows = await sunbiz.search_by_officer(query)
     else:
-        result = run_single(args.seed, args.scraper_type, args.limit)
+        rows = await sunbiz.search_by_name(query)
 
-    if args.json:
-        print(json.dumps(result))
+    found: list[dict[str, Any]] = []
+    for row in rows:
+        if not row.get("name") or not row.get("detail_url"):
+            continue
+        try:
+            details = await sunbiz.get_entity_details(row["detail_url"])
+        except Exception as exc:  # noqa: BLE001
+            state.errors.append(f"sunbiz/{row['name']}: {exc}")
+            continue
+        merged_name = details.get("name") or row["name"]
+        document_number = details.get("document_number") or row.get("document_number") or ""
+        eid = _stable_id(merged_name, document_number)
+        agent_obj = details.get("registered_agent")
+        agent_name = agent_obj.get("name") if isinstance(agent_obj, dict) else None
+        entity = {
+            "id": eid,
+            "name": merged_name,
+            "type": details.get("type") or "corp",
+            "ein": details.get("ein"),
+            "state": "FL",
+            "status": details.get("status") or "active",
+            "registered_agent": agent_name,
+            "officers": details.get("officers") or [],
+            "sunbiz_url": details.get("sunbiz_url") or row.get("detail_url"),
+            "metadata": {"document_number": document_number},
+        }
+        state.entities[eid] = entity
+
+        for officer in entity["officers"]:
+            officer_name = (officer.get("name") or "").strip()
+            if not officer_name:
+                continue
+            indiv_id = _ensure_individual(state, officer_name)
+            state.add_relationship(
+                {
+                    "source_id": indiv_id,
+                    "target_id": eid,
+                    "type": "officer",
+                    "amount": None,
+                    "description": officer.get("title") or "officer",
+                    "year": None,
+                }
+            )
+
+        if agent_name:
+            agent_id = _ensure_individual(state, agent_name)
+            state.add_relationship(
+                {
+                    "source_id": agent_id,
+                    "target_id": eid,
+                    "type": "registered_agent",
+                    "amount": None,
+                    "description": "registered agent",
+                    "year": None,
+                }
+            )
+
+        found.append(entity)
+    return found
+
+
+async def crawl(
+    seed: str, seed_type: str = "ein", depth: int = 2
+) -> dict[str, Any]:
+    state = CrawlState()
+
+    async def visit(name: str | None, ein: str | None, current_depth: int) -> None:
+        if current_depth > depth:
+            return
+        key = _visit_key(name or "", ein)
+        if key in state.visited:
+            return
+        state.visited.add(key)
+
+        # ProPublica + IRS for EIN
+        if ein:
+            _progress(f"ProPublica lookup for EIN {ein} (depth {current_depth})")
+            entity = await _process_propublica(state, ein)
+            if entity and not name:
+                name = entity.get("name")
+            try:
+                await irs.search_by_ein(ein)
+            except Exception as exc:  # noqa: BLE001
+                state.errors.append(f"irs/{ein}: {exc}")
+
+        # Sunbiz search by name
+        if name:
+            _progress(f"Sunbiz search for '{name}' (depth {current_depth})")
+            entities = await _process_sunbiz_search(state, name, "name")
+            state.flush()
+
+            if current_depth + 1 <= depth:
+                for ent in entities:
+                    # Recurse on officers / agent
+                    for officer in ent.get("officers") or []:
+                        oname = (officer.get("name") or "").strip()
+                        if oname:
+                            _progress(
+                                f"Recursing officer search: {oname} (depth {current_depth + 1})"
+                            )
+                            await _process_sunbiz_search(state, oname, "officer")
+                            state.flush()
+                    if ent.get("registered_agent"):
+                        await _process_sunbiz_search(
+                            state, ent["registered_agent"], "officer"
+                        )
+                        state.flush()
+                    # If nonprofit and has EIN, hit ProPublica
+                    if ent.get("type") == "nonprofit" and ent.get("ein"):
+                        await _process_propublica(state, ent["ein"], ent["id"])
+                        state.flush()
+        state.flush()
+
+    if seed_type == "ein":
+        await visit(None, seed, 1)
     else:
-        print(json.dumps(result, indent=2))
+        await visit(seed, None, 1)
 
-    return 0
+    state.flush()
 
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+    return {
+        "entities": list(state.entities.values()),
+        "relationships": list(state.relationships.values()),
+        "financials": list(state.financials.values()),
+        "errors": state.errors,
+    }
