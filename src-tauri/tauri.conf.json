@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "shellhound",
+  "productName": "Shellhound",
   "version": "0.1.0",
   "identifier": "com.edwardq.shellhound",
   "build": {
@@ -13,9 +13,11 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "shellhound",
-        "width": 800,
-        "height": 600
+        "title": "Shellhound",
+        "width": 1320,
+        "height": 860,
+        "minWidth": 960,
+        "minHeight": 640
       }
     ],
     "security": {

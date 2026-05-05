@@ -1,0 +1,34 @@
+[
+  {
+    "source_id": "ent-civic-light-foundation",
+    "target_id": "person-harper-lane",
+    "type": "officer",
+    "amount": null,
+    "description": "Harper Lane is listed as an officer",
+    "year": 2024
+  },
+  {
+    "source_id": "person-harper-lane",
+    "target_id": "ent-lantern-strategy-llc",
+    "type": "manager",
+    "amount": null,
+    "description": "Harper Lane manages Lantern Strategy LLC",
+    "year": 2024
+  },
+  {
+    "source_id": "ent-orange-county-grants",
+    "target_id": "ent-civic-light-foundation",
+    "type": "grant",
+    "amount": 250000,
+    "description": "County grant award",
+    "year": 2023
+  },
+  {
+    "source_id": "ent-civic-light-foundation",
+    "target_id": "ent-lantern-strategy-llc",
+    "type": "vendor-payment",
+    "amount": 82000,
+    "description": "Program management services",
+    "year": 2023
+  }
+]
