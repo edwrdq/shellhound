@@ -94,20 +94,53 @@ fn write_financials(data: Value) -> Result<(), String> {
     write_json_file("financials.json", data)
 }
 
+fn scraper_dir() -> Result<PathBuf, String> {
+    Ok(workspace_root()?.join("scraper"))
+}
+
+fn ensure_scraper_environment(scraper_directory: &PathBuf) -> Result<(), String> {
+    if scraper_directory.join(".venv").exists() {
+        return Ok(());
+    }
+
+    let output = Command::new("uv")
+        .arg("sync")
+        .current_dir(scraper_directory)
+        .output()
+        .map_err(|error| format!("Unable to run uv sync: {error}"))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Err(format!(
+        "uv sync failed with {}: {}{}",
+        output.status, stderr, stdout
+    ))
+}
+
 fn invoke_python(
-    python: &str,
+    scraper_directory: &PathBuf,
     script: &PathBuf,
     seed: &str,
     scraper_type: &str,
 ) -> Result<Output, String> {
-    Command::new(python)
-        .arg(script)
+    let root = workspace_root()?;
+    let script_arg = script.strip_prefix(&root).unwrap_or(script.as_path());
+
+    Command::new("uv")
+        .arg("run")
+        .arg("python")
+        .arg(script_arg)
         .arg("--seed")
         .arg(seed)
         .arg("--scraper-type")
         .arg(scraper_type)
         .arg("--json")
-        .current_dir(workspace_root()?)
+        .env("UV_PROJECT", scraper_directory)
+        .current_dir(root)
         .output()
         .map_err(|error| error.to_string())
 }
@@ -119,42 +152,30 @@ fn run_scraper(seed: String, scraper_type: String) -> Result<Value, String> {
         return Err("Seed is required".to_string());
     }
 
-    let root = workspace_root()?;
-    let script = root.join("scraper").join("crawler.py");
+    let scraper_directory = scraper_dir()?;
+    let script = scraper_directory.join("crawler.py");
     if !script.exists() {
         return Err(format!("Scraper script not found at {}", script.display()));
     }
 
-    let candidates = if cfg!(target_os = "windows") {
-        vec!["python", "py"]
-    } else {
-        vec!["python3", "python"]
-    };
+    ensure_scraper_environment(&scraper_directory)?;
 
-    let mut last_error = None;
-
-    for python in candidates {
-        match invoke_python(python, &script, seed, &scraper_type) {
-            Ok(output) if output.status.success() => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                return serde_json::from_str(&stdout)
-                    .map_err(|error| format!("Scraper returned invalid JSON: {error}"));
-            }
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                last_error = Some(format!(
-                    "{python} exited with {}: {}{}",
-                    output.status, stderr, stdout
-                ));
-            }
-            Err(error) => {
-                last_error = Some(format!("{python}: {error}"));
-            }
+    match invoke_python(&scraper_directory, &script, seed, &scraper_type) {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            serde_json::from_str(&stdout)
+                .map_err(|error| format!("Scraper returned invalid JSON: {error}"))
         }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            Err(format!(
+                "uv run python exited with {}: {}{}",
+                output.status, stderr, stdout
+            ))
+        }
+        Err(error) => Err(format!("uv run python: {error}")),
     }
-
-    Err(last_error.unwrap_or_else(|| "Unable to run Python scraper".to_string()))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

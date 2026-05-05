@@ -13,6 +13,7 @@ dist-ssr
 *.local
 __pycache__/
 *.pyc
+scraper/.venv/
 
 # Editor directories and files
 .vscode/*

@@ -22,23 +22,21 @@ Install frontend dependencies:
 bun install
 ```
 
-Install scraper dependencies:
+Install `uv` for Python scraper dependency management:
 
 ```sh
-python3 -m pip install -r scraper/requirements.txt
+curl -LsSf https://astral.sh/uv | sh
 ```
+
+The scraper's only required system dependency is `uv`.
+The scraper environment is created automatically on first run. When
+`scraper/.venv` is missing, Shellhound runs `uv sync` in `scraper/` before
+launching the scraper.
 
 Run the desktop app:
 
 ```sh
 bun run tauri dev
-```
-
-On Linux, Tauri also needs native WebKitGTK development packages. On Debian or
-Ubuntu:
-
-```sh
-sudo apt install libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
 ```
 
 Build the frontend:
@@ -50,7 +48,7 @@ bun run build
 Run a scraper directly:
 
 ```sh
-python3 scraper/crawler.py --seed "Civic Light Foundation" --scraper-type crawler --json
+uv run --project scraper python scraper/crawler.py --seed "Civic Light Foundation" --scraper-type crawler --json
 ```
 
 ## Tauri Commands
